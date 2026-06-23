@@ -3745,6 +3745,18 @@ def _chromium_installed() -> bool:
         _cached_chromium_installed = True
         return True
 
+    # 2b. Check agent-browser Chrome install path (Hermes/container fallback)
+    hermes_agent_chrome = "/home/openclaw/.agent-browser/browsers/chrome-148.0.7778.167/chrome"
+    if os.path.isfile(hermes_agent_chrome):
+        _cached_chromium_installed = True
+        return True
+
+    # 2c. Check ~/.local/bin wrapper (user PATH fallback)
+    local_bin_chrome = os.path.expanduser("~/.local/bin/google-chrome")
+    if os.path.isfile(local_bin_chrome):
+        _cached_chromium_installed = True
+        return True
+
     # 3. Playwright browser cache (legacy — chromium-* / chromium_headless_shell-* dirs)
     for root in _chromium_search_roots():
         if not root or not os.path.isdir(root):

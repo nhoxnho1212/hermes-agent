@@ -4224,6 +4224,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True  # handled (silently dropped); do not fall through
 
+        # --- Multichoice supersede ---
+        # If the agent is blocked on ask_user_buttons and the user is now
+        # sending free-form text (not a slash command), abandon the buttons
+        # prompt so the tool unblocks with CANCELLED. The message then flows
+        # through the normal busy queue/interrupt path below.
+        try:
+            if event.message_type == MessageType.TEXT and not event.get_command():
+                from tools.multichoice import has_pending as _mc_has_pending, cancel_session as _mc_cancel
+                if _mc_has_pending(session_key):
+                    _mc_adapter = self.adapters.get(event.source.platform)
+                    if _mc_adapter is not None and hasattr(_mc_adapter, "cancel_multichoice_for_session"):
+                        try:
+                            await _mc_adapter.cancel_multichoice_for_session(
+                                session_key,
+                                suffix="bị bỏ qua — bạn đã chat tiếp",
+                            )
+                        except Exception as _mc_exc:
+                            logger.debug(
+                                "cancel_multichoice_for_session failed for %s: %s",
+                                session_key, _mc_exc,
+                            )
+                    _mc_cancel(session_key)
+                    logger.info(
+                        "Multichoice for session %s cancelled by incoming text (busy path)",
+                        session_key,
+                    )
+        except Exception as _mc_exc:
+            logger.debug("multichoice cancel-on-text (busy) failed: %s", _mc_exc)
+
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
             adapter = self.adapters.get(event.source.platform)
@@ -7601,6 +7630,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_running_agent_state(_quick_key)
 
         if _quick_key in self._running_agents:
+            # If the agent is blocked waiting on an ask_user_buttons /
+            # multichoice prompt and the user is now sending free-form text
+            # instead of clicking, abort the pending prompt so the tool
+            # unblocks (with CANCELLED) and the user's new message can flow
+            # through the usual queue/interrupt/steer path. Slash commands
+            # keep their own semantics — they go through dedicated handlers.
+            try:
+                if event.message_type == MessageType.TEXT and not event.get_command():
+                    from tools.multichoice import has_pending as _mc_has_pending, cancel_session as _mc_cancel
+                    if _mc_has_pending(_quick_key):
+                        _mc_adapter = self.adapters.get(source.platform)
+                        if _mc_adapter is not None and hasattr(_mc_adapter, "cancel_multichoice_for_session"):
+                            try:
+                                await _mc_adapter.cancel_multichoice_for_session(
+                                    _quick_key,
+                                    suffix="bị bỏ qua — bạn đã chat tiếp",
+                                )
+                            except Exception as _mc_exc:
+                                logger.debug(
+                                    "cancel_multichoice_for_session failed for %s: %s",
+                                    _quick_key, _mc_exc,
+                                )
+                        _mc_cancel(_quick_key)
+                        logger.info(
+                            "Multichoice for session %s cancelled by incoming text",
+                            _quick_key,
+                        )
+            except Exception as _mc_exc:
+                logger.debug("multichoice cancel-on-text check failed: %s", _mc_exc)
+
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
 
@@ -8340,9 +8399,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
-                    if asyncio.iscoroutine(result):
-                        result = await result
+                    # Bind session contextvars so plugin handlers can read
+                    # HERMES_SESSION_* via gateway.session_context.get_session_env().
+                    # The full session env is normally set later in
+                    # _handle_message_with_agent; plugin slash commands short-
+                    # circuit that path, so we set them here too.
+                    from gateway.session_context import set_session_vars, clear_session_vars
+                    from gateway.session import build_session_key
+                    try:
+                        _plugin_session_key = build_session_key(source)
+                    except Exception:
+                        _plugin_session_key = ""
+                    _plugin_tokens = set_session_vars(
+                        platform=source.platform.value if source.platform else "",
+                        chat_id=str(source.chat_id) if source.chat_id is not None else "",
+                        chat_name=str(source.chat_name) if source.chat_name else "",
+                        thread_id=str(source.thread_id) if source.thread_id is not None else "",
+                        user_id=str(source.user_id) if source.user_id is not None else "",
+                        user_name=str(source.user_name) if source.user_name else "",
+                        session_key=_plugin_session_key,
+                    )
+                    try:
+                        result = plugin_handler(user_args)
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                    finally:
+                        clear_session_vars(_plugin_tokens)
                     return str(result) if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
@@ -16415,6 +16497,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _heartbeat_msg_id: Optional[str] = None
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
+                # Suppress heartbeat while the agent is intentionally
+                # blocked on a multichoice prompt (ask_user_buttons) —
+                # this is user-pending, not stuck.
+                try:
+                    from tools.multichoice import has_pending as _mc_has_pending
+                    if session_key and _mc_has_pending(session_key):
+                        continue
+                except Exception:
+                    pass
                 # Stop heartbeating once this run no longer owns the session
                 # slot or the executor has finished — otherwise a stale
                 # "running: delegate_task" bubble can outlive the run that

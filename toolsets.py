@@ -55,6 +55,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
+    # Inline-button multichoice prompt (Telegram-only; check_fn surfaces errors elsewhere)
+    "ask_user_buttons",
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
@@ -225,7 +227,7 @@ TOOLSETS = {
     
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
-        "tools": ["clarify"],
+        "tools": ["clarify", "ask_user_buttons"],
         "includes": []
     },
     
