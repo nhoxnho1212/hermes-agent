@@ -1,0 +1,18 @@
+FROM nousresearch/hermes-agent:upstream-bak
+
+# Overlay patches từ feat/telegram-multichoice-buttons (rebased on origin/main):
+#   25d7a97c2 feat(telegram): add inline-button multichoice prompt tool
+#   b8e73cb2a feat(telegram): add built-in Cancel button to multichoice prompt
+#   8b5558430 feat(telegram): supersede pending multichoice when user chats text
+#   c3e082585 feat(telegram): add /delete_topic command to remove forum topics
+#   90e979c16 fix(browser): add agent-browser and ~/.local/bin Chrome fallback paths
+#   364d40c2b fix(telegram): don't report multichoice as expired on duplicate click
+#
+# Layout: gateway/platforms/telegram.py -> plugins/platforms/telegram/adapter.py trên main.
+
+COPY --chown=root:root tools/multichoice.py        /opt/hermes/tools/multichoice.py
+COPY --chown=root:root tools/ask_buttons_tool.py   /opt/hermes/tools/ask_buttons_tool.py
+COPY --chown=root:root tools/browser_tool.py       /opt/hermes/tools/browser_tool.py
+COPY --chown=root:root toolsets.py                 /opt/hermes/toolsets.py
+COPY --chown=root:root gateway/run.py              /opt/hermes/gateway/run.py
+COPY --chown=root:root plugins/platforms/telegram/adapter.py /opt/hermes/plugins/platforms/telegram/adapter.py

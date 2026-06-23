@@ -17,7 +17,7 @@ import tempfile
 import html as _html
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -591,6 +591,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Multichoice button state: short_id → session_key, plus initiator gating.
+        # Only the user who triggered the prompt may click.
+        self._multichoice_state: Dict[str, str] = {}
+        self._multichoice_initiator: Dict[str, str] = {}
+        # Reverse lookup so we can find the buttons message from a session_key
+        # when free-form text arrives mid-prompt and we want to clear buttons.
+        self._multichoice_session_to_short: Dict[str, str] = {}
+        # short_id → (chat_id, message_id, thread_id, question_text) — needed
+        # to edit the original message and strip the inline keyboard.
+        self._multichoice_msg_meta: Dict[str, Dict[str, Any]] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -1964,6 +1974,65 @@ class TelegramAdapter(BasePlatformAdapter):
             self.name, chat_id, thread_id, name,
         )
 
+    async def delete_dm_topic(
+        self,
+        chat_id: int,
+        thread_id: int,
+        *,
+        persist: bool = True,
+    ) -> bool:
+        """Delete a forum topic (DM or supergroup) and clean local + persisted state.
+
+        Returns True on a successful API call. Bot needs ``can_manage_topics``
+        right in the chat; the General topic (thread_id 1) cannot be deleted.
+        """
+        if not self._bot:
+            return False
+        try:
+            chat_id_int = int(chat_id)
+            thread_id_int = int(thread_id)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[%s] delete_dm_topic: invalid chat_id=%r or thread_id=%r",
+                self.name, chat_id, thread_id,
+            )
+            return False
+        try:
+            await self._bot.delete_forum_topic(
+                chat_id=chat_id_int,
+                message_thread_id=thread_id_int,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] delete_dm_topic failed for chat %s thread_id=%s: %s",
+                self.name, chat_id_int, thread_id_int, exc,
+            )
+            return False
+
+        # Drop matching cache entries (key is "chat_id:topic_name").
+        for cache_key, cached_tid in list(self._dm_topics.items()):
+            try:
+                ck_chat, _, _ = cache_key.partition(":")
+                if int(ck_chat) == chat_id_int and int(cached_tid) == thread_id_int:
+                    self._dm_topics.pop(cache_key, None)
+            except (TypeError, ValueError):
+                continue
+
+        if persist:
+            try:
+                self._remove_dm_topic_from_config(chat_id_int, thread_id_int)
+            except Exception as cfg_exc:
+                logger.warning(
+                    "[%s] delete_dm_topic: config cleanup failed (chat %s thread_id=%s): %s",
+                    self.name, chat_id_int, thread_id_int, cfg_exc,
+                )
+
+        logger.info(
+            "[%s] Deleted DM topic in chat %s thread_id=%s",
+            self.name, chat_id_int, thread_id_int,
+        )
+        return True
+
     def _persist_dm_topic_thread_id(
         self,
         chat_id: int,
@@ -2046,6 +2115,101 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
         except Exception as e:
             logger.warning("[%s] Failed to persist thread_id to config: %s", self.name, e, exc_info=True)
+
+    def _remove_dm_topic_from_config(self, chat_id: int, thread_id: int) -> None:
+        """Strip a topic entry from config.yaml dm_topics by chat_id + thread_id.
+
+        Also drops the in-memory ``self._dm_topics_config`` mirror so a
+        subsequent ``_reload_dm_topics_from_config`` won't re-cache it.
+        If the chat entry's ``topics`` list becomes empty, the whole
+        chat entry is removed too.
+        """
+        try:
+            from hermes_constants import get_hermes_home
+            config_path = get_hermes_home() / "config.yaml"
+            if not config_path.exists():
+                logger.warning(
+                    "[%s] Config file not found at %s, cannot remove thread_id",
+                    self.name, config_path,
+                )
+                return
+
+            import yaml as _yaml
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = _yaml.safe_load(f) or {}
+
+            tg_extra = (
+                config.get("platforms", {})
+                .get("telegram", {})
+                .get("extra", {})
+            )
+            dm_topics = tg_extra.get("dm_topics", [])
+            if not dm_topics:
+                return
+
+            changed = False
+            kept_chats: List[Dict[str, Any]] = []
+            for chat_entry in dm_topics:
+                try:
+                    entry_chat = int(chat_entry.get("chat_id", 0))
+                except (TypeError, ValueError):
+                    entry_chat = 0
+                if entry_chat != int(chat_id):
+                    kept_chats.append(chat_entry)
+                    continue
+                kept_topics = []
+                for t in chat_entry.get("topics", []):
+                    try:
+                        tid = int(t.get("thread_id")) if t.get("thread_id") is not None else None
+                    except (TypeError, ValueError):
+                        tid = None
+                    if tid == int(thread_id):
+                        changed = True
+                        continue
+                    kept_topics.append(t)
+                if kept_topics:
+                    new_entry = dict(chat_entry)
+                    new_entry["topics"] = kept_topics
+                    kept_chats.append(new_entry)
+                else:
+                    changed = True  # whole chat entry dropped
+
+            if not changed:
+                return
+
+            tg_extra["dm_topics"] = kept_chats
+
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(config_path.parent),
+                suffix=".tmp",
+                prefix=".config_",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    _yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                atomic_replace(tmp_path, config_path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+
+            # Mirror change in the in-memory snapshot so reload helpers
+            # don't repopulate the cache with stale entries.
+            self._dm_topics_config = kept_chats
+
+            logger.info(
+                "[%s] Removed topic thread_id=%s in chat %s from config.yaml",
+                self.name, thread_id, chat_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] Failed to remove thread_id from config: %s",
+                self.name, e, exc_info=True,
+            )
 
     async def _setup_dm_topics(self) -> None:
         """Load or create configured DM topics for specified chats.
@@ -2265,6 +2429,10 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            # Dev/test command: /test_buttons — renders a multichoice prompt
+            self._app.add_handler(CommandHandler("test_buttons", self._handle_test_buttons))
+            # /delete_topic [thread_id] — delete a forum topic and clean config.
+            self._app.add_handler(CommandHandler("delete_topic", self._handle_delete_topic))
             
             # Start polling — retry initialize() for transient TLS resets
             try:
@@ -2368,6 +2536,8 @@ class TelegramAdapter(BasePlatformAdapter):
             # Register bot commands so Telegram shows a hint menu when users type /
             # List is derived from the central COMMAND_REGISTRY — adding a new
             # gateway command there automatically adds it to the Telegram menu.
+            # Adapter-local commands (handled by ``_adapter_local_commands``) are
+            # prepended so they show up too — they don't live in the registry.
             try:
                 from telegram import (
                     BotCommand,
@@ -2379,8 +2549,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Telegram allows up to 100 commands but has an undocumented
                 # payload size limit (~4KB total).  Limit to 30 core commands
                 # to stay well under the threshold while covering all categories.
-                menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
-                bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
+                adapter_local_menu: List[Tuple[str, str]] = [
+                    ("delete_topic", "Xoá topic hiện tại (hoặc /delete_topic <thread_id>)"),
+                ]
+                menu_commands, hidden_count = telegram_menu_commands(
+                    max_commands=max(1, MAX_COMMANDS_PER_SCOPE - len(adapter_local_menu)),
+                )
+                registry_names = {name for name, _ in menu_commands}
+                final_menu = [
+                    (name, desc) for name, desc in adapter_local_menu
+                    if name not in registry_names
+                ] + list(menu_commands)
+                final_menu = final_menu[:MAX_COMMANDS_PER_SCOPE]
+                bot_commands = [BotCommand(name, desc) for name, desc in final_menu]
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall
                 # through to AllGroupChats or Default).
@@ -2398,7 +2579,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if hidden_count:
                     logger.info(
                         "[%s] Telegram menu: %d commands registered, %d hidden (over %d limit). Use /commands for full list.",
-                        self.name, len(menu_commands), hidden_count, 30,
+                        self.name, len(final_menu), hidden_count, MAX_COMMANDS_PER_SCOPE,
                     )
             except Exception as e:
                 logger.warning(
@@ -3529,6 +3710,207 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_exec_approval failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_multichoice_prompt(
+        self, chat_id: str, question: str, options: List[str],
+        session_key: str, short_id: str, initiator_user_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a question with N inline-button choices.
+
+        Callback data is ``mc:<short_id>:<idx>`` to stay within Telegram's
+        64-byte limit. The full option label is looked up by ``short_id``
+        in :mod:`tools.multichoice` when the user clicks.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        if not options:
+            return SendResult(success=False, error="No options provided")
+
+        try:
+            rows = []
+            for i in range(0, len(options), 2):
+                row = [
+                    InlineKeyboardButton(opt[:40], callback_data=f"mch:{short_id}:{i + j}")
+                    for j, opt in enumerate(options[i:i + 2])
+                ]
+                rows.append(row)
+            # Built-in Cancel row — lets the initiator abort without picking.
+            rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"mch:{short_id}:cancel")])
+            keyboard = InlineKeyboardMarkup(rows)
+
+            thread_id = self._metadata_thread_id(metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "text": question,
+                "parse_mode": ParseMode.MARKDOWN,
+                "reply_markup": keyboard,
+                **self._link_preview_kwargs(),
+            }
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata)
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id, thread_id, metadata,
+                    reply_to_message_id=reply_to_id,
+                )
+            )
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+
+            self._multichoice_state[short_id] = session_key
+            self._multichoice_initiator[short_id] = str(initiator_user_id or "")
+            self._multichoice_session_to_short[session_key] = short_id
+            self._multichoice_msg_meta[short_id] = {
+                "chat_id": int(chat_id),
+                "message_id": int(msg.message_id),
+                "thread_id": thread_id,
+                "question": question,
+            }
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_multichoice_prompt failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
+    async def cancel_multichoice_for_session(
+        self,
+        session_key: str,
+        suffix: str = "superseded",
+    ) -> bool:
+        """Strip the inline keyboard for the buttons message tied to ``session_key``.
+
+        Called from the gateway when free-form text arrives while a multichoice
+        prompt is still pending, so the user can't click stale buttons after
+        the conversation has moved on. Idempotent — safe to call when nothing
+        is pending. Returns True if an edit was attempted.
+        """
+        short_id = self._multichoice_session_to_short.pop(session_key, None)
+        if not short_id:
+            return False
+        meta = self._multichoice_msg_meta.pop(short_id, None)
+        self._multichoice_state.pop(short_id, None)
+        self._multichoice_initiator.pop(short_id, None)
+        if not meta or not self._bot:
+            return False
+        try:
+            question = meta.get("question") or ""
+            suffix_md = f"_↳ {suffix}_" if suffix else ""
+            new_text = f"{question}\n\n{suffix_md}".rstrip()
+            await self._bot.edit_message_reply_markup(
+                chat_id=meta["chat_id"],
+                message_id=meta["message_id"],
+                reply_markup=None,
+            )
+            if suffix_md:
+                try:
+                    await self._bot.edit_message_text(
+                        chat_id=meta["chat_id"],
+                        message_id=meta["message_id"],
+                        text=new_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+            return True
+        except Exception as exc:
+            logger.debug("[%s] cancel_multichoice_for_session edit failed: %s", self.name, exc)
+            return False
+
+    async def _handle_test_buttons(self, update, context) -> None:
+        """Dev hook: /test_buttons → render a sample multichoice prompt.
+
+        Demonstrates the full path: send_multichoice_prompt → user clicks
+        → _handle_callback_query 'mc:' branch → tools.multichoice.resolve →
+        the awaiting task here gets the choice and replies.
+        """
+        from tools.multichoice import register, wait, CANCELLED
+        msg = update.effective_message
+        chat_id = str(msg.chat_id)
+        user_id = str(update.effective_user.id) if update.effective_user else ""
+        session_key = f"telegram:test_buttons:{chat_id}:{user_id}"
+
+        options = ["🍎 Apple", "🍊 Orange", "🍇 Grape"]
+        short_id = register(session_key, options, user_id)
+
+        result = await self.send_multichoice_prompt(
+            chat_id=chat_id,
+            question="*Test buttons* — chọn trái cây yêu thích:",
+            options=options,
+            session_key=session_key,
+            short_id=short_id,
+            initiator_user_id=user_id,
+        )
+        if not result.success:
+            await msg.reply_text(f"Send failed: {result.error}")
+            return
+
+        choice = await wait(session_key, timeout=300)
+        if choice is None:
+            await msg.reply_text("⏱ Timeout — không có ai bấm.")
+        elif choice == CANCELLED:
+            await msg.reply_text("❌ Bạn đã huỷ.")
+        else:
+            await msg.reply_text(f"✅ Bạn đã chọn: *{choice}*", parse_mode=ParseMode.MARKDOWN)
+
+    async def _handle_delete_topic(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """`/delete_topic [thread_id]` — delete the current (or specified) forum topic.
+
+        - With no arg: deletes the topic the command was sent in
+          (``update.message.message_thread_id``). Refuses in the General topic.
+        - With ``thread_id`` arg: deletes that topic in the same chat.
+
+        Auth: gated by ``_should_process_message`` (same allowlist as other
+        commands). The bot must hold ``can_manage_topics`` in the chat.
+        """
+        msg = update.message
+        if not msg:
+            return
+        if not self._should_process_message(msg, is_command=True):
+            return
+
+        # Parse optional thread_id arg
+        arg_thread_id: Optional[int] = None
+        if context and getattr(context, "args", None):
+            try:
+                arg_thread_id = int(context.args[0])
+            except (TypeError, ValueError):
+                await msg.reply_text(
+                    "Usage: `/delete_topic` (current topic) or `/delete_topic <thread_id>`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+        target_thread_id = arg_thread_id if arg_thread_id is not None else msg.message_thread_id
+        if not target_thread_id:
+            await msg.reply_text(
+                "⚠️ Lệnh này phải chạy trong một topic, hoặc dùng `/delete_topic <thread_id>`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        if int(target_thread_id) == 1:
+            await msg.reply_text("⚠️ Không thể xoá topic *General*.", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        chat_id = msg.chat_id
+        ok = await self.delete_dm_topic(int(chat_id), int(target_thread_id))
+        if ok:
+            # If the user deleted the *current* topic, replying inside it
+            # would fail (topic is gone). Send a chat-level confirmation
+            # instead — Telegram will drop it into the General topic.
+            if arg_thread_id is None:
+                try:
+                    await self._bot.send_message(
+                        chat_id=int(chat_id),
+                        text=f"🗑 Đã xoá topic (thread_id={int(target_thread_id)}).",
+                    )
+                except Exception:
+                    pass
+            else:
+                await msg.reply_text(f"🗑 Đã xoá topic thread_id={int(target_thread_id)}.")
+        else:
+            await msg.reply_text(
+                f"❌ Không xoá được topic thread_id={int(target_thread_id)}. "
+                "Kiểm tra quyền `can_manage_topics` của bot hoặc log để xem chi tiết.",
+            )
+
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
         confirm_id: str, metadata: Optional[Dict[str, Any]] = None,
@@ -4226,6 +4608,100 @@ class TelegramAdapter(BasePlatformAdapter):
                 # button click.
                 if count and query_chat_id is not None:
                     self.resume_typing_for_chat(str(query_chat_id))
+            return
+
+        # --- Multichoice callbacks (mc:short_id:{idx|cancel}) ---
+        if data.startswith("mch:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3:
+                await query.answer(text="Invalid data.")
+                return
+            short_id, idx_str = parts[1], parts[2]
+            is_cancel = idx_str == "cancel"
+            if not is_cancel:
+                try:
+                    idx = int(idx_str)
+                except ValueError:
+                    await query.answer(text="Invalid index.")
+                    return
+
+            # Initiator gating — only the user who triggered the prompt may click.
+            caller_id = str(getattr(query.from_user, "id", ""))
+            initiator = self._multichoice_initiator.get(short_id, "")
+            if initiator and caller_id != initiator:
+                await query.answer(text="⛔ Câu hỏi này không dành cho bạn.")
+                return
+
+            # Look up state WITHOUT removing it first — a duplicate click
+            # (Telegram retries, double-tap, network lag) used to pop the
+            # state and then misreport "Đã hết hạn" even though the prompt
+            # was still live. We pop only after we've committed to handling
+            # this click. mc_resolve is idempotent on the tools/ side, so
+            # losing a race with cancel_multichoice_for_session just turns
+            # the second handler into a no-op instead of a confusing toast.
+            session_key = self._multichoice_state.get(short_id)
+            if not session_key:
+                await query.answer(text="Đã hết hạn hoặc đã trả lời.")
+                return
+            self._multichoice_state.pop(short_id, None)
+            self._multichoice_initiator.pop(short_id, None)
+            self._multichoice_msg_meta.pop(short_id, None)
+            self._multichoice_session_to_short.pop(session_key, None)
+
+            try:
+                from tools.multichoice import get_by_id, resolve as mc_resolve, CANCELLED
+            except Exception as exc:
+                logger.error("Failed to import tools.multichoice: %s", exc)
+                await query.answer(text="Internal error.")
+                return
+
+            if is_cancel:
+                await query.answer(text="❌ Đã huỷ")
+                try:
+                    original_text = getattr(query.message, "text", "") or ""
+                    await query.edit_message_text(
+                        text=f"{original_text}\n\n→ _❌ Cancelled_",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass  # non-fatal
+                try:
+                    mc_resolve(session_key, CANCELLED)
+                    logger.info(
+                        "Telegram button cancelled multichoice for session %s (user=%s)",
+                        session_key, query_user_name,
+                    )
+                except Exception as exc:
+                    logger.error("Failed to resolve multichoice cancel: %s", exc)
+                return
+
+            lookup = get_by_id(short_id)
+            options = lookup[1].get("options", []) if lookup else []
+            if idx < 0 or idx >= len(options):
+                await query.answer(text="Lựa chọn không hợp lệ.")
+                return
+            choice = options[idx]
+
+            await query.answer(text=f"✓ {choice[:50]}")
+            try:
+                original_text = getattr(query.message, "text", "") or ""
+                await query.edit_message_text(
+                    text=f"{original_text}\n\n→ *{choice}*",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass  # non-fatal
+
+            try:
+                mc_resolve(session_key, choice)
+                logger.info(
+                    "Telegram button resolved multichoice for session %s (choice=%s, user=%s)",
+                    session_key, choice, query_user_name,
+                )
+            except Exception as exc:
+                logger.error("Failed to resolve multichoice: %s", exc)
             return
 
         # --- Slash-confirm callbacks (sc:choice:confirm_id) ---
@@ -6173,12 +6649,28 @@ class TelegramAdapter(BasePlatformAdapter):
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming command messages."""
+        """Handle incoming command messages.
+
+        Adapter-local commands (e.g. ``/delete_topic``) are dispatched here
+        directly because PTB resolves ``filters.COMMAND`` MessageHandlers
+        before dedicated ``CommandHandler``s in the same group — without
+        this intercept the gateway would treat the command as unknown.
+        """
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
         if not self._should_process_message(msg, is_command=True):
             return
+
+        text = msg.text or ""
+        if text.startswith("/"):
+            head = text.split(maxsplit=1)[0]
+            cmd_name = head[1:].split("@", 1)[0].lower()
+            local_handler = self._adapter_local_commands().get(cmd_name)
+            if local_handler is not None:
+                await local_handler(update, context)
+                return
+
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
@@ -6186,6 +6678,17 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
+
+    def _adapter_local_commands(self) -> Dict[str, Any]:
+        """Map command name → bound handler for commands the adapter owns.
+
+        Used by :meth:`_handle_command` to short-circuit before the message
+        is sent through the gateway's command registry.
+        """
+        return {
+            "delete_topic": self._handle_delete_topic,
+            "test_buttons": self._handle_test_buttons,
+        }
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
